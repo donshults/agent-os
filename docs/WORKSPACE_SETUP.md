@@ -30,7 +30,7 @@ git submodule update
 
 ```bash
 cd agent-os
-git remote add upstream https://github.com/buildertools/agent-os.git
+git remote add upstream https://github.com/buildermethods/agent-os.git
 git remote -v  # Verify remotes
 ```
 

@@ -5,6 +5,46 @@ All notable changes to Agent OS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.3] - 2025-10-10
+
+- Updated instructions and default standards to reduce excessive tests writing and test running during feature development to improve speed and token useage.
+- For Claude Code users:
+  - Replaced hard-coding of 'opus' model setting on agents with 'inherit' so that it inherits whichever model your Claude Code is currently using.
+  - Updated create-role script to add the "Inherit" option when creating new agents.
+- Clarified next command to run when in single-agent mode.
+
+## [2.0.2] - 2025-10-09
+
+- Clarified /create-spec command so that task list creation doesn't begin until spec.md has been written.
+- Clarified spec-writer workflow to ensure actual code isn't written in spec.md.
+- Fixed instructions to ensure spec-verification.md is stored in the spec's verication folder.
+- Ensured Claude Code subagents are installed to a project's .claude/agents/agent-os and not sub-folders within that.
+- Fixed compilation of Claude Code implementer and verifier agents not replacing their dynamic tags.
+- Added instruction in single-agent mode to inform user of next command to run during spec creation process.
+
+## [2.0.1] - 2025-10-08
+
+### Fixed
+
+#### Installation Script Compatibility Issues
+
+Fixed bugs in the project installation scripts (`project-install.sh`, `project-update.sh`, and `common-functions.sh`) that caused installations to fail in certain bash environments. These issues were triggered by stricter bash implementations and configurations, particularly when `set -e` (exit on error) was enabled.
+
+## [2.0.0] - 2025-10-07
+
+Agent OS 2.0 is a major new release that brings several core architectural changes and improvements.
+
+The big headline here is the dual mode architecture for supporting both multi-agent tools (Claude Code) and single-agent tools (every other tool).
+
+[this page](https://buildermethods.com/agent-os/version-2) documents:
+
+- The new features in Agent OS 2.0
+- Architectural changes in 2.0
+- What changed from 1.x
+- Updating guide
+
+[The Agent OS docs](https://buildermethods.com/agent-os) also received a complete overhaul and expansion.  It's now broken out into multiple pages that document every detail of how to install, use and customize Agent OS.
+
 ## [1.4.2] - 2025-08-24
 
 ### Enforced full three-phase task execution

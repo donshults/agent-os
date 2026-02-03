@@ -5,11 +5,11 @@
 # Installs Agent OS into a project's codebase
 # =============================================================================
 
-set -e  # Exit on error
+set -e
 
 # Get the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-BASE_DIR="$HOME/agent-os"
+BASE_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_DIR="$(pwd)"
 
 # Source common functions
@@ -19,19 +19,9 @@ source "$SCRIPT_DIR/common-functions.sh"
 # Default Values
 # -----------------------------------------------------------------------------
 
-DRY_RUN="false"
 VERBOSE="false"
 PROFILE=""
-MULTI_AGENT_MODE=""
-MULTI_AGENT_TOOL=""
-SINGLE_AGENT_MODE=""
-SINGLE_AGENT_TOOL=""
-RE_INSTALL="false"
-OVERWRITE_ALL="false"
-OVERWRITE_STANDARDS="false"
-OVERWRITE_COMMANDS="false"
-OVERWRITE_AGENTS="false"
-INSTALLED_FILES=()
+COMMANDS_ONLY="false"
 
 # -----------------------------------------------------------------------------
 # Help Function
@@ -44,25 +34,15 @@ Usage: $0 [OPTIONS]
 Install Agent OS into the current project directory.
 
 Options:
-    --profile PROFILE           Use specified profile (default: from config.yml)
-    --multi-agent-mode [BOOL]   Enable/disable multi-agent mode
-    --multi-agent-tool TOOL     Specify multi-agent tool
-    --single-agent-mode [BOOL]  Enable/disable single-agent mode
-    --single-agent-tool TOOL    Specify single-agent tool
-    --re-install                Delete and reinstall Agent OS
-    --overwrite-all             Overwrite all existing files during update
-    --overwrite-standards       Overwrite existing standards during update
-    --overwrite-commands        Overwrite existing commands during update
-    --overwrite-agents          Overwrite existing agents during update
-    --dry-run                   Show what would be done without doing it
-    --verbose                   Show detailed output
-    -h, --help                  Show this help message
+    --profile <name>     Use specified profile (default: from config.yml)
+    --commands-only      Only update commands, preserve existing standards
+    --verbose            Show detailed output
+    -h, --help           Show this help message
 
 Examples:
     $0
     $0 --profile rails
-    $0 --multi-agent-mode true --multi-agent-tool claude-code
-    $0 --single-agent-mode --dry-run
+    $0 --commands-only
 
 EOF
     exit 0
@@ -79,44 +59,8 @@ parse_arguments() {
                 PROFILE="$2"
                 shift 2
                 ;;
-            --multi-agent-mode)
-                read MULTI_AGENT_MODE shift_count <<< "$(parse_bool_flag "$MULTI_AGENT_MODE" "$2")"
-                shift $shift_count
-                ;;
-            --multi-agent-tool)
-                MULTI_AGENT_TOOL="$2"
-                shift 2
-                ;;
-            --single-agent-mode)
-                read SINGLE_AGENT_MODE shift_count <<< "$(parse_bool_flag "$SINGLE_AGENT_MODE" "$2")"
-                shift $shift_count
-                ;;
-            --single-agent-tool)
-                SINGLE_AGENT_TOOL="$2"
-                shift 2
-                ;;
-            --re-install)
-                RE_INSTALL="true"
-                shift
-                ;;
-            --overwrite-all)
-                OVERWRITE_ALL="true"
-                shift
-                ;;
-            --overwrite-standards)
-                OVERWRITE_STANDARDS="true"
-                shift
-                ;;
-            --overwrite-commands)
-                OVERWRITE_COMMANDS="true"
-                shift
-                ;;
-            --overwrite-agents)
-                OVERWRITE_AGENTS="true"
-                shift
-                ;;
-            --dry-run)
-                DRY_RUN="true"
+            --commands-only)
+                COMMANDS_ONLY="true"
                 shift
                 ;;
             --verbose)
@@ -135,470 +79,335 @@ parse_arguments() {
 }
 
 # -----------------------------------------------------------------------------
+# Validation Functions
+# -----------------------------------------------------------------------------
+
+validate_base_installation() {
+    if [[ ! -d "$BASE_DIR" ]]; then
+        print_error "Agent OS base installation not found"
+        exit 1
+    fi
+
+    if [[ ! -f "$BASE_DIR/config.yml" ]]; then
+        print_error "Base installation config.yml not found"
+        exit 1
+    fi
+}
+
+validate_not_in_base() {
+    if [[ "$PROJECT_DIR" == "$BASE_DIR" ]]; then
+        print_error "Cannot install Agent OS in the base installation directory"
+        echo ""
+        echo "Navigate to your project directory first:"
+        echo "  cd /path/to/your/project"
+        echo ""
+        exit 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # Configuration Functions
 # -----------------------------------------------------------------------------
 
 load_configuration() {
-    # Load base configuration using common function
-    load_base_config
+    local config_file="$BASE_DIR/config.yml"
 
-    # Set effective values (command line overrides base config)
-    EFFECTIVE_PROFILE="${PROFILE:-$BASE_PROFILE}"
-    EFFECTIVE_MULTI_AGENT_MODE="${MULTI_AGENT_MODE:-$BASE_MULTI_AGENT_MODE}"
-    EFFECTIVE_MULTI_AGENT_TOOL="${MULTI_AGENT_TOOL:-$BASE_MULTI_AGENT_TOOL}"
-    EFFECTIVE_SINGLE_AGENT_MODE="${SINGLE_AGENT_MODE:-$BASE_SINGLE_AGENT_MODE}"
-    EFFECTIVE_SINGLE_AGENT_TOOL="${SINGLE_AGENT_TOOL:-$BASE_SINGLE_AGENT_TOOL}"
-    EFFECTIVE_VERSION="$BASE_VERSION"
+    # Get default profile from config
+    local default_profile=$(get_yaml_value "$config_file" "default_profile" "default")
 
-    # Validate configuration using common function
-    validate_config "$EFFECTIVE_MULTI_AGENT_MODE" "$EFFECTIVE_SINGLE_AGENT_MODE" "$EFFECTIVE_PROFILE"
+    # Use command line profile or default
+    EFFECTIVE_PROFILE="${PROFILE:-$default_profile}"
 
-    print_verbose "Configuration loaded:"
-    print_verbose "  Profile: $EFFECTIVE_PROFILE"
-    print_verbose "  Multi-agent mode: $EFFECTIVE_MULTI_AGENT_MODE (tool: $EFFECTIVE_MULTI_AGENT_TOOL)"
-    print_verbose "  Single-agent mode: $EFFECTIVE_SINGLE_AGENT_MODE (tool: $EFFECTIVE_SINGLE_AGENT_TOOL)"
+    # Validate profile exists
+    if [[ ! -d "$BASE_DIR/profiles/$EFFECTIVE_PROFILE" ]]; then
+        print_error "Profile not found: $EFFECTIVE_PROFILE"
+        exit 1
+    fi
+
+    # Build inheritance chain
+    local chain_result=$(get_profile_inheritance_chain "$config_file" "$EFFECTIVE_PROFILE" "$BASE_DIR/profiles")
+
+    # Check for errors
+    if [[ "$chain_result" == CIRCULAR:* ]]; then
+        local cycle_path="${chain_result#CIRCULAR:}"
+        echo ""
+        print_error "Circular dependency detected in profile inheritance chain:"
+        echo "  $cycle_path"
+        echo ""
+        echo "Please fix the inheritance configuration in:"
+        echo "  $config_file"
+        echo ""
+        echo "The 'profiles' section contains a circular reference that must be resolved."
+        exit 1
+    fi
+
+    if [[ "$chain_result" == NOTFOUND:* ]]; then
+        local missing_profile="${chain_result#NOTFOUND:}"
+        print_error "Profile not found: $missing_profile"
+        echo ""
+        echo "This profile is referenced in the inheritance chain but doesn't exist."
+        echo "Check the 'profiles' section in: $config_file"
+        exit 1
+    fi
+
+    # Store the inheritance chain (newline-separated, base first)
+    INHERITANCE_CHAIN="$chain_result"
+
+    print_verbose "Using profile: $EFFECTIVE_PROFILE"
+    print_verbose "Inheritance chain: $(echo "$INHERITANCE_CHAIN" | tr '\n' ' ')"
+}
+
+# -----------------------------------------------------------------------------
+# Confirmation Functions
+# -----------------------------------------------------------------------------
+
+confirm_standards_overwrite() {
+    if [[ "$COMMANDS_ONLY" == "true" ]]; then
+        return 0
+    fi
+
+    local existing_standards="$PROJECT_DIR/agent-os/standards"
+
+    if [[ -d "$existing_standards" ]]; then
+        echo ""
+        print_warning "Existing standards folder detected at: $existing_standards"
+        echo ""
+        echo "This will overwrite your existing standards with standards from the '$EFFECTIVE_PROFILE' profile."
+        echo ""
+        read -p "Do you want to continue? (y/N) " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo ""
+            echo "Installation cancelled."
+            echo ""
+            echo "To update only commands without touching standards, use:"
+            echo "  $0 --commands-only"
+            echo ""
+            exit 0
+        fi
+    fi
 }
 
 # -----------------------------------------------------------------------------
 # Installation Functions
 # -----------------------------------------------------------------------------
 
-# Install standards files
-install_standards() {
-    if [[ "$DRY_RUN" != "true" ]]; then
-        print_status "Installing standards"
-    fi
+create_project_structure() {
+    print_status "Creating project structure..."
 
-    local standards_count=0
-
-    while read file; do
-        if [[ "$file" == standards/* ]]; then
-            local source=$(get_profile_file "$EFFECTIVE_PROFILE" "$file" "$BASE_DIR")
-            local dest="$PROJECT_DIR/agent-os/$file"
-
-            if [[ -f "$source" ]]; then
-                local installed_file=$(copy_file "$source" "$dest")
-                if [[ -n "$installed_file" ]]; then
-                    INSTALLED_FILES+=("$installed_file")
-                    ((standards_count++)) || true
-                fi
-            fi
-        fi
-    done < <(get_profile_files "$EFFECTIVE_PROFILE" "$BASE_DIR" "standards")
-
-    if [[ "$DRY_RUN" != "true" ]]; then
-        if [[ $standards_count -gt 0 ]]; then
-            echo "✓ Installed $standards_count standards in agent-os/standards"
-        fi
-    fi
-}
-
-# Install roles files - Needed for single-agent mode
-install_roles() {
-    if [[ "$DRY_RUN" != "true" ]]; then
-        print_status "Installing roles"
-    fi
-
-    local roles_count=0
-
-    while read file; do
-        if [[ "$file" == roles/* ]]; then
-            local source=$(get_profile_file "$EFFECTIVE_PROFILE" "$file" "$BASE_DIR")
-            local dest="$PROJECT_DIR/agent-os/$file"
-
-            if [[ -f "$source" ]]; then
-                local installed_file=$(copy_file "$source" "$dest")
-                if [[ -n "$installed_file" ]]; then
-                    INSTALLED_FILES+=("$installed_file")
-                    ((roles_count++)) || true
-                fi
-            fi
-        fi
-    done < <(get_profile_files "$EFFECTIVE_PROFILE" "$BASE_DIR" "roles")
-
-    if [[ "$DRY_RUN" != "true" ]]; then
-        if [[ $roles_count -gt 0 ]]; then
-            echo "✓ Installed $roles_count files in agent-os/roles"
-        fi
-    fi
-}
-
-# Install and compile single-agent mode commands
-install_single_agent_commands() {
-    if [[ "$DRY_RUN" != "true" ]]; then
-        print_status "Installing single-agent mode commands..."
-    fi
-
-    local commands_count=0
-
-    while read file; do
-        # Include files that are in single-agent folders
-        if [[ "$file" == commands/*/single-agent/* ]]; then
-            local source=$(get_profile_file "$EFFECTIVE_PROFILE" "$file" "$BASE_DIR")
-            if [[ -f "$source" ]]; then
-                local dest=""
-
-                # If both modes are enabled, preserve the folder structure (single-agent/ and multi-agent/)
-                if [[ "$EFFECTIVE_MULTI_AGENT_MODE" == "true" ]]; then
-                    # Keep full path including single-agent subfolder
-                    dest="$PROJECT_DIR/agent-os/$file"
-                else
-                    # Only single-agent mode: strip the single-agent/ subfolder
-                    local dest_file=$(echo "$file" | sed 's/\/single-agent//')
-                    dest="$PROJECT_DIR/agent-os/$dest_file"
-                fi
-
-                local compiled=$(compile_command "$source" "$dest" "$BASE_DIR" "$EFFECTIVE_PROFILE")
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    INSTALLED_FILES+=("$dest")
-                fi
-                ((commands_count++)) || true
-            fi
-        fi
-    done < <(get_profile_files "$EFFECTIVE_PROFILE" "$BASE_DIR" "commands")
-
-    # If both modes are enabled, also copy multi-agent commands to agent-os
-    if [[ "$EFFECTIVE_MULTI_AGENT_MODE" == "true" ]]; then
-        while read file; do
-            if [[ "$file" == commands/*/multi-agent/* ]]; then
-                local source=$(get_profile_file "$EFFECTIVE_PROFILE" "$file" "$BASE_DIR")
-                if [[ -f "$source" ]]; then
-                    local dest="$PROJECT_DIR/agent-os/$file"
-                    local compiled=$(compile_command "$source" "$dest" "$BASE_DIR" "$EFFECTIVE_PROFILE")
-                    if [[ "$DRY_RUN" == "true" ]]; then
-                        INSTALLED_FILES+=("$dest")
-                    fi
-                    ((commands_count++)) || true
-                fi
-            fi
-        done < <(get_profile_files "$EFFECTIVE_PROFILE" "$BASE_DIR" "commands")
-    fi
-
-    if [[ "$DRY_RUN" != "true" ]]; then
-        if [[ $commands_count -gt 0 ]]; then
-            echo "✓ Installed $commands_count single-agent commands"
-        fi
-    fi
-}
-
-# Install and compile multi-agent mode files for Claude Code
-install_claude_code_files() {
-    if [[ "$DRY_RUN" != "true" ]]; then
-        print_status "Installing Claude Code tools"
-    fi
-
-    local commands_count=0
-    local agents_count=0
-
-    # Install commands to .claude/commands/agent-os/
-    while read file; do
-        if [[ "$file" == commands/*/multi-agent/* ]]; then
-            local source=$(get_profile_file "$EFFECTIVE_PROFILE" "$file" "$BASE_DIR")
-            if [[ -f "$source" ]]; then
-                # Extract command name from path
-                local command_name=$(echo "$file" | sed 's/commands\///' | sed 's/\/multi-agent.*//')
-                local dest="$PROJECT_DIR/.claude/commands/agent-os/${command_name}.md"
-
-                local compiled=$(compile_command "$source" "$dest" "$BASE_DIR" "$EFFECTIVE_PROFILE")
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    INSTALLED_FILES+=("$dest")
-                fi
-                ((commands_count++)) || true
-            fi
-        fi
-    done < <(get_profile_files "$EFFECTIVE_PROFILE" "$BASE_DIR" "commands")
-
-    if [[ "$DRY_RUN" != "true" ]]; then
-        if [[ $commands_count -gt 0 ]]; then
-            echo "✓ Installed $commands_count Claude Code commands"
-        fi
-    fi
-
-    # Install static agents to .claude/agents/agent-os/
-    get_profile_files "$EFFECTIVE_PROFILE" "$BASE_DIR" "agents" | while read file; do
-        if [[ "$file" == agents/*.md ]] && [[ "$file" != agents/templates/* ]]; then
-            local source=$(get_profile_file "$EFFECTIVE_PROFILE" "$file" "$BASE_DIR")
-            if [[ -f "$source" ]]; then
-                local agent_name=$(basename "$file" .md)
-                local dest="$PROJECT_DIR/.claude/agents/agent-os/${agent_name}.md"
-
-                local compiled=$(compile_agent "$source" "$dest" "$BASE_DIR" "$EFFECTIVE_PROFILE" "")
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    INSTALLED_FILES+=("$dest")
-                fi
-                ((agents_count++)) || true
-            fi
-        fi
-    done
-
-    # Install specification agents
-    get_profile_files "$EFFECTIVE_PROFILE" "$BASE_DIR" "agents/specification" | while read file; do
-        if [[ "$file" == agents/specification/*.md ]]; then
-            local source=$(get_profile_file "$EFFECTIVE_PROFILE" "$file" "$BASE_DIR")
-            if [[ -f "$source" ]]; then
-                local agent_name=$(basename "$file" .md)
-                local dest="$PROJECT_DIR/.claude/agents/agent-os/${agent_name}.md"
-
-                local compiled=$(compile_agent "$source" "$dest" "$BASE_DIR" "$EFFECTIVE_PROFILE" "")
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    INSTALLED_FILES+=("$dest")
-                fi
-                ((agents_count++)) || true
-            fi
-        fi
-    done
-
-    # Generate and install implementer agents
-    local implementers_file=$(get_profile_file "$EFFECTIVE_PROFILE" "roles/implementers.yml" "$BASE_DIR")
-    if [[ -f "$implementers_file" ]]; then
-        local template_file=$(get_profile_file "$EFFECTIVE_PROFILE" "agents/templates/implementer.md" "$BASE_DIR")
-        if [[ -f "$template_file" ]]; then
-            # Get list of implementer IDs
-            local implementer_ids=$(awk '/^  - id:/ {print $3}' "$implementers_file")
-
-            for id in $implementer_ids; do
-                print_verbose "Generating implementer agent: $id"
-
-                # Build role data with delimiter-based format for multi-line values
-                local role_data=""
-                role_data="${role_data}<<<id>>>"$'\n'"$id"$'\n'"<<<END>>>"$'\n'
-
-                local description=$(parse_role_yaml "$implementers_file" "implementers" "$id" "description")
-                role_data="${role_data}<<<description>>>"$'\n'"$description"$'\n'"<<<END>>>"$'\n'
-
-                local your_role=$(parse_role_yaml "$implementers_file" "implementers" "$id" "your_role")
-                role_data="${role_data}<<<your_role>>>"$'\n'"$your_role"$'\n'"<<<END>>>"$'\n'
-
-                local tools=$(parse_role_yaml "$implementers_file" "implementers" "$id" "tools")
-                role_data="${role_data}<<<tools>>>"$'\n'"$tools"$'\n'"<<<END>>>"$'\n'
-
-                local model=$(parse_role_yaml "$implementers_file" "implementers" "$id" "model")
-                role_data="${role_data}<<<model>>>"$'\n'"$model"$'\n'"<<<END>>>"$'\n'
-
-                local color=$(parse_role_yaml "$implementers_file" "implementers" "$id" "color")
-                role_data="${role_data}<<<color>>>"$'\n'"$color"$'\n'"<<<END>>>"$'\n'
-
-                # Get areas of responsibility
-                local areas=$(parse_role_yaml "$implementers_file" "implementers" "$id" "areas_of_responsibility")
-                role_data="${role_data}<<<areas_of_responsibility>>>"$'\n'"$areas"$'\n'"<<<END>>>"$'\n'
-
-                # Get example areas outside of responsibility
-                local example_areas_outside=$(parse_role_yaml "$implementers_file" "implementers" "$id" "example_areas_outside_of_responsibility")
-                role_data="${role_data}<<<example_areas_outside_of_responsibility>>>"$'\n'"$example_areas_outside"$'\n'"<<<END>>>"$'\n'
-
-                # Get standards
-                local standards_patterns=$(get_role_standards "$implementers_file" "implementers" "$id")
-                local standards_list=$(process_standards "" "$BASE_DIR" "$EFFECTIVE_PROFILE" "$standards_patterns")
-                role_data="${role_data}<<<implementer_standards>>>"$'\n'"$standards_list"$'\n'"<<<END>>>"$'\n'
-
-                # Compile agent
-                local dest="$PROJECT_DIR/.claude/agents/agent-os/${id}.md"
-                local compiled=$(compile_agent "$template_file" "$dest" "$BASE_DIR" "$EFFECTIVE_PROFILE" "$role_data")
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    INSTALLED_FILES+=("$dest")
-                fi
-                ((agents_count++)) || true
-            done
-        fi
-    fi
-
-    # Generate and install area verifier agents
-    local verifiers_file=$(get_profile_file "$EFFECTIVE_PROFILE" "roles/verifiers.yml" "$BASE_DIR")
-    if [[ -f "$verifiers_file" ]]; then
-        local template_file=$(get_profile_file "$EFFECTIVE_PROFILE" "agents/templates/verifier.md" "$BASE_DIR")
-        if [[ -f "$template_file" ]]; then
-            # Get list of verifier IDs
-            local verifier_ids=$(awk '/^  - id:/ {print $3}' "$verifiers_file")
-
-            for id in $verifier_ids; do
-                print_verbose "Generating area verifier agent: $id"
-
-                # Build role data with delimiter-based format for multi-line values
-                local role_data=""
-                role_data="${role_data}<<<id>>>"$'\n'"$id"$'\n'"<<<END>>>"$'\n'
-
-                local description=$(parse_role_yaml "$verifiers_file" "verifiers" "$id" "description")
-                role_data="${role_data}<<<description>>>"$'\n'"$description"$'\n'"<<<END>>>"$'\n'
-
-                local your_role=$(parse_role_yaml "$verifiers_file" "verifiers" "$id" "your_role")
-                role_data="${role_data}<<<your_role>>>"$'\n'"$your_role"$'\n'"<<<END>>>"$'\n'
-
-                local tools=$(parse_role_yaml "$verifiers_file" "verifiers" "$id" "tools")
-                role_data="${role_data}<<<tools>>>"$'\n'"$tools"$'\n'"<<<END>>>"$'\n'
-
-                local model=$(parse_role_yaml "$verifiers_file" "verifiers" "$id" "model")
-                role_data="${role_data}<<<model>>>"$'\n'"$model"$'\n'"<<<END>>>"$'\n'
-
-                local color=$(parse_role_yaml "$verifiers_file" "verifiers" "$id" "color")
-                role_data="${role_data}<<<color>>>"$'\n'"$color"$'\n'"<<<END>>>"$'\n'
-
-                # Get areas of responsibility
-                local areas=$(parse_role_yaml "$verifiers_file" "verifiers" "$id" "areas_of_responsibility")
-                role_data="${role_data}<<<areas_of_responsibility>>>"$'\n'"$areas"$'\n'"<<<END>>>"$'\n'
-
-                # Get example areas outside of responsibility
-                local example_areas_outside=$(parse_role_yaml "$verifiers_file" "verifiers" "$id" "example_areas_outside_of_responsibility")
-                role_data="${role_data}<<<example_areas_outside_of_responsibility>>>"$'\n'"$example_areas_outside"$'\n'"<<<END>>>"$'\n'
-
-                # Get standards
-                local standards_patterns=$(get_role_standards "$verifiers_file" "verifiers" "$id")
-                local standards_list=$(process_standards "" "$BASE_DIR" "$EFFECTIVE_PROFILE" "$standards_patterns")
-                role_data="${role_data}<<<verifier_standards>>>"$'\n'"$standards_list"$'\n'"<<<END>>>"$'\n'
-
-                # Compile agent
-                local dest="$PROJECT_DIR/.claude/agents/agent-os/${id}.md"
-                local compiled=$(compile_agent "$template_file" "$dest" "$BASE_DIR" "$EFFECTIVE_PROFILE" "$role_data")
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    INSTALLED_FILES+=("$dest")
-                fi
-                ((agents_count++)) || true
-            done
-        fi
-    fi
-
-    if [[ "$DRY_RUN" != "true" ]]; then
-        if [[ $agents_count -gt 0 ]]; then
-            echo "✓ Installed $agents_count Claude Code agents"
-        fi
-    fi
-}
-
-
-# Create agent-os folder structure
-create_agent_os_folder() {
-    if [[ "$DRY_RUN" != "true" ]]; then
-        print_status "Installing agent-os folder"
-    fi
-
-    # Create the main agent-os folder
     ensure_dir "$PROJECT_DIR/agent-os"
+    ensure_dir "$PROJECT_DIR/agent-os/standards"
 
-    # Create the configuration file
-    local config_file=$(write_project_config "$EFFECTIVE_VERSION" "$EFFECTIVE_PROFILE" \
-        "$EFFECTIVE_MULTI_AGENT_MODE" "$EFFECTIVE_MULTI_AGENT_TOOL" \
-        "$EFFECTIVE_SINGLE_AGENT_MODE" "$EFFECTIVE_SINGLE_AGENT_TOOL")
-    if [[ "$DRY_RUN" == "true" && -n "$config_file" ]]; then
-        INSTALLED_FILES+=("$config_file")
-    fi
-
-    if [[ "$DRY_RUN" != "true" ]]; then
-        echo "✓ Created agent-os folder"
-        echo "✓ Created agent-os project configuration"
-    fi
+    print_success "Created agent-os/ directory structure"
 }
 
-# Perform fresh installation
-perform_installation() {
-    # Show dry run warning at the top if applicable
-    if [[ "$DRY_RUN" == "true" ]]; then
-        print_warning "DRY RUN - No files will be actually created"
-        echo ""
+install_standards() {
+    if [[ "$COMMANDS_ONLY" == "true" ]]; then
+        print_status "Skipping standards (--commands-only)"
+        return
     fi
 
-    # Display configuration at the top
     echo ""
-    print_status "Configuration:"
-    echo -e "  Profile: ${YELLOW}$EFFECTIVE_PROFILE${NC}"
-    echo -e "  Multi-agent mode: ${YELLOW}$EFFECTIVE_MULTI_AGENT_MODE${NC}"
-    if [[ "$EFFECTIVE_MULTI_AGENT_MODE" == "true" ]]; then
-        echo -e "  Multi-agent tool: ${YELLOW}$EFFECTIVE_MULTI_AGENT_TOOL${NC}"
-    fi
-    echo -e "  Single-agent mode: ${YELLOW}$EFFECTIVE_SINGLE_AGENT_MODE${NC}"
-    if [[ "$EFFECTIVE_SINGLE_AGENT_MODE" == "true" ]]; then
-        echo -e "  Single-agent tool: ${YELLOW}$EFFECTIVE_SINGLE_AGENT_TOOL${NC}"
-    fi
-    echo ""
+    print_status "Installing standards..."
 
-    # In dry run mode, just collect files silently
-    if [[ "$DRY_RUN" == "true" ]]; then
-        # Collect files without output
-        create_agent_os_folder
-        install_standards
-        if [[ "$EFFECTIVE_SINGLE_AGENT_MODE" == "true" ]]; then
-            install_roles
-            install_single_agent_commands
-        fi
-        if [[ "$EFFECTIVE_MULTI_AGENT_MODE" == "true" ]] && [[ "$EFFECTIVE_MULTI_AGENT_TOOL" == "claude-code" ]]; then
-            install_claude_code_files
+    local project_standards="$PROJECT_DIR/agent-os/standards"
+    local profiles_used=0
+
+    # Temp file to track file sources (format: relative_path|profile_name)
+    local sources_file=$(mktemp)
+    trap "rm -f $sources_file" EXIT
+
+    # Process each profile in the inheritance chain (base first, so later ones override)
+    while IFS= read -r profile_name; do
+        [[ -z "$profile_name" ]] && continue
+
+        local profile_standards="$BASE_DIR/profiles/$profile_name/standards"
+
+        if [[ ! -d "$profile_standards" ]]; then
+            continue
         fi
 
-        echo ""
-        print_status "The following files would be created:"
-        for file in "${INSTALLED_FILES[@]}"; do
-            # Make paths relative to project root
-            local relative_path="${file#$PROJECT_DIR/}"
-            echo "  - $relative_path"
+        local profile_file_count=0
+
+        # Find all .md files in this profile, excluding .backups
+        while IFS= read -r -d '' file; do
+            local relative_path="${file#$profile_standards/}"
+            local dest_file="$project_standards/$relative_path"
+
+            ensure_dir "$(dirname "$dest_file")"
+            cp "$file" "$dest_file"
+
+            # Track the source - remove old entry if exists, add new one
+            grep -v "^${relative_path}|" "$sources_file" > "${sources_file}.tmp" 2>/dev/null || true
+            mv "${sources_file}.tmp" "$sources_file"
+            echo "${relative_path}|${profile_name}" >> "$sources_file"
+            ((profile_file_count++))
+        done < <(find "$profile_standards" -name "*.md" -type f ! -path "*/.backups/*" -print0 2>/dev/null)
+
+        if [[ "$profile_file_count" -gt 0 ]]; then
+            ((profiles_used++))
+        fi
+    done <<< "$INHERITANCE_CHAIN"
+
+    # Count profiles in chain to determine if we show sources
+    local chain_count=$(echo "$INHERITANCE_CHAIN" | grep -c .)
+
+    # Count and display
+    local total_count=$(wc -l < "$sources_file" | tr -d ' ')
+
+    if [[ "$total_count" -gt 0 ]]; then
+        # Sort and display files - only show source if inheritance is present
+        sort "$sources_file" | while IFS='|' read -r filepath profile; do
+            if [[ "$chain_count" -gt 1 ]]; then
+                echo "  $filepath (from $profile)"
+            else
+                echo "  $filepath"
+            fi
         done
-    else
-        # Normal installation with output
-        create_agent_os_folder
-        echo ""
 
-        install_standards
-        echo ""
-
-        if [[ "$EFFECTIVE_SINGLE_AGENT_MODE" == "true" ]]; then
-            install_roles
-            echo ""
-            install_single_agent_commands
-            echo ""
-        fi
-
-        if [[ "$EFFECTIVE_MULTI_AGENT_MODE" == "true" ]] && [[ "$EFFECTIVE_MULTI_AGENT_TOOL" == "claude-code" ]]; then
-            install_claude_code_files
-            echo ""
-        fi
-    fi
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        echo ""
-        read -p "Proceed with actual installation? (y/n): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            DRY_RUN="false"
-            INSTALLED_FILES=()
-            perform_installation
+        if [[ "$profiles_used" -gt 1 ]]; then
+            print_success "Installed $total_count standards files (from $profiles_used profiles)"
+        else
+            print_success "Installed $total_count standards files"
         fi
     else
-        print_success "Agent OS has been successfully installed in your project!"
-        echo ""
-        echo -e "${GREEN}Visit the docs for guides on how to use Agent OS: https://buildermethods.com/agent-os${NC}"
-        echo ""
+        print_success "No standards to install (profile is empty)"
     fi
 }
 
-# Handle re-installation
-handle_reinstallation() {
-    print_section "Re-installation"
-
-    print_warning "This will DELETE your current agent-os/ folder and reinstall from scratch."
+create_index() {
     echo ""
+    print_status "Updating standards index..."
 
-    # Check for Claude Code files
-    if [[ -d "$PROJECT_DIR/.claude/agents/agent-os" ]] || [[ -d "$PROJECT_DIR/.claude/commands/agent-os" ]]; then
-        print_warning "This will also DELETE:"
-        [[ -d "$PROJECT_DIR/.claude/agents/agent-os" ]] && echo "  - .claude/agents/agent-os/"
-        [[ -d "$PROJECT_DIR/.claude/commands/agent-os" ]] && echo "  - .claude/commands/agent-os/"
-        echo ""
+    local standards_dir="$PROJECT_DIR/agent-os/standards"
+    local index_file="$standards_dir/index.yml"
+    local temp_file="$standards_dir/.index_temp.yml"
+    local old_index=""
+
+    # Save existing index content for description lookup
+    if [[ -f "$index_file" ]]; then
+        old_index=$(cat "$index_file")
     fi
 
-    read -p "Are you sure you want to proceed? (y/n): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_status "Re-installation cancelled"
-        exit 0
+    local entry_count=0
+    local new_count=0
+
+    # Start fresh
+    echo "# Agent OS Standards Index" > "$temp_file"
+    echo "" >> "$temp_file"
+
+    # Helper to get existing description from old index
+    # Looks for pattern: folder:\n  filename:\n    description: ...
+    get_existing_description() {
+        local folder="$1"
+        local filename="$2"
+
+        if [[ -z "$old_index" ]]; then
+            return 1
+        fi
+
+        # Use awk to find the description for this folder/file combo
+        local desc=$(echo "$old_index" | awk -v folder="$folder" -v file="$filename" '
+            $0 ~ "^"folder":$" { in_folder=1; next }
+            /^[a-zA-Z0-9_-]+:$/ { in_folder=0 }
+            in_folder && $0 ~ "^  "file":$" { in_file=1; next }
+            in_folder && /^  [a-zA-Z0-9_-]+:$/ { in_file=0 }
+            in_folder && in_file && /description:/ {
+                sub(/^[[:space:]]*description:[[:space:]]*/, "")
+                print
+                exit
+            }
+        ')
+
+        if [[ -n "$desc" && "$desc" != "Needs description - run /index-standards" ]]; then
+            echo "$desc"
+            return 0
+        fi
+        return 1
+    }
+
+    # First, handle root-level .md files (not in subfolders)
+    local root_files=$(find "$standards_dir" -maxdepth 1 -name "*.md" -type f 2>/dev/null | sort)
+    if [[ -n "$root_files" ]]; then
+        echo "root:" >> "$temp_file"
+        while IFS= read -r file; do
+            local filename=$(basename "$file" .md)
+            local desc=$(get_existing_description "root" "$filename")
+            if [[ -z "$desc" ]]; then
+                desc="Needs description - run /index-standards"
+                ((new_count++))
+            fi
+            echo "  $filename:" >> "$temp_file"
+            echo "    description: $desc" >> "$temp_file"
+            ((entry_count++))
+        done <<< "$root_files"
+        echo "" >> "$temp_file"
     fi
 
-    if [[ "$DRY_RUN" != "true" ]]; then
-        print_status "Removing existing installation..."
-        rm -rf "$PROJECT_DIR/agent-os"
-        rm -rf "$PROJECT_DIR/.claude/agents/agent-os"
-        rm -rf "$PROJECT_DIR/.claude/commands/agent-os"
-        echo "✓ Existing installation removed"
-        echo ""
+    # Then handle files in subfolders
+    local folders=$(find "$standards_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+    for folder in $folders; do
+        local folder_name=$(basename "$folder")
+        local md_files=$(find "$folder" -name "*.md" -type f 2>/dev/null | sort)
+
+        if [[ -n "$md_files" ]]; then
+            echo "$folder_name:" >> "$temp_file"
+            while IFS= read -r file; do
+                local filename=$(basename "$file" .md)
+                local desc=$(get_existing_description "$folder_name" "$filename")
+                if [[ -z "$desc" ]]; then
+                    desc="Needs description - run /index-standards"
+                    ((new_count++))
+                fi
+                echo "  $filename:" >> "$temp_file"
+                echo "    description: $desc" >> "$temp_file"
+                ((entry_count++))
+            done <<< "$md_files"
+            echo "" >> "$temp_file"
+        fi
+    done
+
+    # Move temp file to final location
+    mv "$temp_file" "$index_file"
+
+    if [[ "$entry_count" -gt 0 ]]; then
+        if [[ "$new_count" -gt 0 ]]; then
+            print_success "Updated index.yml ($entry_count entries, $new_count new)"
+        else
+            print_success "Updated index.yml ($entry_count entries)"
+        fi
+    else
+        print_success "Created index.yml (no standards to index)"
+    fi
+}
+
+install_commands() {
+    echo ""
+    print_status "Installing commands..."
+
+    local commands_source="$BASE_DIR/commands/agent-os"
+    local commands_dest="$PROJECT_DIR/.claude/commands/agent-os"
+
+    if [[ ! -d "$commands_source" ]]; then
+        print_warning "No commands found in base installation"
+        return
     fi
 
-    perform_installation
+    ensure_dir "$commands_dest"
+
+    local count=0
+    for file in "$commands_source"/*.md; do
+        if [[ -f "$file" ]]; then
+            cp "$file" "$commands_dest/"
+            ((count++))
+        fi
+    done
+
+    if [[ "$count" -gt 0 ]]; then
+        print_success "Installed $count commands to .claude/commands/agent-os/"
+    else
+        print_warning "No command files found"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -608,31 +417,60 @@ handle_reinstallation() {
 main() {
     print_section "Agent OS Project Installation"
 
-    # Parse command line arguments
+    # Parse arguments
     parse_arguments "$@"
 
-    # Check if we're trying to install in the base installation directory
-    check_not_base_installation
-
-    # Validate base installation using common function
+    # Validations
+    validate_not_in_base
     validate_base_installation
 
     # Load configuration
     load_configuration
 
-    # Check if Agent OS is already installed
-    if is_agent_os_installed "$PROJECT_DIR"; then
-        if [[ "$RE_INSTALL" == "true" ]]; then
-            handle_reinstallation
+    # Show configuration
+    echo ""
+    print_status "Configuration:"
+
+    # Display inheritance chain
+    local chain_depth=0
+    local chain_display=""
+    # Read chain in reverse order (from requested profile back to base) for display
+    local reversed_chain=$(echo "$INHERITANCE_CHAIN" | tac)
+    while IFS= read -r profile_name; do
+        [[ -z "$profile_name" ]] && continue
+        if [[ "$chain_depth" -eq 0 ]]; then
+            chain_display="  Profile: $profile_name"
         else
-            # Delegate to update script
-            print_status "Agent OS is already installed. Running update..."
-            exec "$BASE_DIR/scripts/project-update.sh" "$@"
+            local indent=""
+            for ((i=0; i<chain_depth; i++)); do
+                indent="$indent  "
+            done
+            chain_display="$chain_display"$'\n'"$indent  ↳ inherits from: $profile_name"
         fi
-    else
-        # Fresh installation
-        perform_installation
-    fi
+        ((chain_depth++))
+    done <<< "$reversed_chain"
+    echo "$chain_display"
+
+    echo "  Commands only: $COMMANDS_ONLY"
+
+    # Confirm overwrite if standards folder exists
+    confirm_standards_overwrite
+
+    echo ""
+
+    # Install
+    create_project_structure
+    install_standards
+    create_index
+    install_commands
+
+    echo ""
+    print_success "Agent OS installed successfully!"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Run /discover-standards to extract patterns from your codebase"
+    echo "  2. Run /inject-standards to inject standards into your context"
+    echo ""
 }
 
 # Run main function

@@ -1,0 +1,47 @@
+name: Sync fork with upstream
+
+# Keeps donshults/agent-os in lockstep with buildermethods/agent-os.
+# Fork is a clean mirror, so fast-forward sync only — no merge resolution.
+# If main ever diverges (e.g. accidental direct commit), the workflow
+# will fail loudly rather than force-push, so you can investigate.
+
+on:
+  schedule:
+    # Daily at 12:00 UTC = 4:00 AM PST / 5:00 AM PDT.
+    # Runs before Don's trading session starts.
+    - cron: '0 12 * * *'
+  workflow_dispatch: {}  # Manual trigger from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Sync main with upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          echo "Syncing donshults/agent-os:main from buildermethods/agent-os:main..."
+          OUTPUT=$(gh repo sync donshults/agent-os \
+            --source buildermethods/agent-os \
+            --branch main 2>&1)
+          echo "$OUTPUT"
+
+          # Surface result in the Actions UI summary
+          {
+            echo "## Sync result"
+            echo ""
+            echo '```'
+            echo "$OUTPUT"
+            echo '```'
+            echo ""
+            echo "_Run completed at $(date -u +'%Y-%m-%d %H:%M:%S UTC')_"
+          } >> "$GITHUB_STEP_SUMMARY"
